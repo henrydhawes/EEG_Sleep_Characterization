@@ -1,83 +1,96 @@
-"""Main script to batch-load and process multiple sleep recordings."""
-from pathlib import Path
+"""Data access for the whole group.
+
+Most people only need load_epoch_table(): the shared table of features and
+labels (built once by features.py), so nobody has to touch the raw EDF files.
+
+batch_load_raw() is for anyone who needs the raw signal itself (for example a
+neural network on raw EEG). Raw arrays are large, so use max_recordings.
+"""
 import numpy as np
+import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 
-# Import our custom functions from load_data.py
-from load_data import download_and_extract, find_recordings, load_epochs
+from constants import EPOCH_TABLE_PATH, SEED
 
 
-def batch_load_data(max_recordings=5):
-    """Load and concatenate epochs from multiple recordings with error handling."""
-    # 1. Ensure data is downloaded and extracted
+def load_epoch_table(sleep_only=True, rebuild=False):
+    """Load the shared epoch table (building it first if it doesn't exist).
+
+    sleep_only=True keeps only epochs inside the sleep period (sleep onset to the
+    first epoch of the final wake bout). That includes mid-night wake, which is
+    the awakening data. Use sleep_only=False for the whole recording.
+    """
+    if rebuild or not EPOCH_TABLE_PATH.exists():
+        from features import build_epoch_table  # imported here so mne is only needed to build
+        build_epoch_table(rebuild=rebuild)
+    df = pd.read_csv(EPOCH_TABLE_PATH)
+    if sleep_only:
+        df = df[df["in_sleep_period"]].reset_index(drop=True)
+    return df
+
+
+def split_by_subject(subjects, test_size=0.2, seed=SEED):
+    """Split by PERSON so no one appears in both train and test.
+
+    subjects: one subject ID per row (e.g. df["subject"].to_numpy()).
+    Returns (train_idx, test_idx); use df.iloc[train_idx] or X[train_idx].
+    Both of a person's nights share the same subject number, so they always
+    land on the same side of the split.
+    """
+    subjects = np.asarray(subjects)
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    train_idx, test_idx = next(gss.split(np.zeros(len(subjects)), groups=subjects))
+    print(f"Train: {len(np.unique(subjects[train_idx]))} subjects, {len(train_idx):,} epochs")
+    print(f"Test:  {len(np.unique(subjects[test_idx]))} subjects, {len(test_idx):,} epochs")
+    return train_idx, test_idx
+
+
+def batch_load_raw(max_recordings=5, sleep_only=True, channels=("EEG Fpz-Cz",)):
+    """Load raw 30 s epochs from several recordings into NumPy arrays.
+
+    Returns X (epochs, channels, time) as float32, y (stage codes), subjects,
+    nights. Returns (None, None, None, None) if nothing could be loaded.
+    Memory: roughly 12 KB per epoch per channel, so the full dataset is several GB.
+    """
+    # imported here so that people who only use the table don't need these
+    from sleep_period import annotate_night
+    from load_data import (download_and_extract, find_recordings, load_recording,
+                           parse_recording_name)
+
     download_and_extract()
-    
-    # 2. Get the list of all available recording pairs
     recs = find_recordings()
-    
-    # Limit to max_recordings for testing (change or remove later for full dataset)
-    selected_recs = recs[:max_recordings]
-    print(f"Processing {len(selected_recs)} out of {len(recs)} total recordings...\n")
-    
-    X_list = []
-    y_list = []
-    subject_ids = []
-    
-    for idx, (psg_path, hyp_path) in enumerate(selected_recs):
-        # Extract unique subject ID from filename (e.g., "SC4001E0" -> "SC4001")
-        subject_id = psg_path.name[:7]
-        print(f"[{idx+1}/{len(selected_recs)}] Loading subject {subject_id}...")
-        
+    selected = recs[:max_recordings] if max_recordings else recs
+    print(f"Processing {len(selected)} out of {len(recs)} total recordings...\n")
+
+    X_list, y_list, subj_list, night_list = [], [], [], []
+    for i, (psg, hyp) in enumerate(selected, 1):
+        print(f"[{i}/{len(selected)}] Loading {psg.name}...")
         try:
-            # TRY to load epochs for this recording
-            X_rec, y_rec = load_epochs(psg_path, hyp_path)
-            
-            # If successful, store them in our lists
-            X_list.append(X_rec)
-            y_list.append(y_rec)
-            
-            # Track patient ID for each epoch (crucial for train/test splitting)
-            subject_ids.extend([subject_id] * len(y_rec))
-            
+            subject, night = parse_recording_name(psg)
+            rec = load_recording(psg, hyp, channels=channels)
+            X, y = rec["X"], rec["stage"]
+            if sleep_only:
+                night_df = pd.DataFrame({"epoch_idx": rec["epoch_idx"], "stage": y})
+                keep = annotate_night(night_df)["in_sleep_period"].to_numpy()
+                X, y = X[keep], y[keep]
+            X_list.append(X.astype(np.float32))
+            y_list.append(y)
+            subj_list.append(np.full(len(y), subject))
+            night_list.append(np.full(len(y), night))
         except Exception as e:
-            # EXCEPT block: catches errors so the script doesn't crash
-            print(f"  ⚠️ Error loading {subject_id}: {e}")
-            print("  Skipping this recording and moving to the next one...")
-            continue
-            
-    # Combine all patient data into master NumPy arrays
-    if X_list:
-        X_all = np.concatenate(X_list, axis=0)
-        y_all = np.concatenate(y_list, axis=0)
-        subject_ids = np.array(subject_ids)
-        return X_all, y_all, subject_ids
-    else:
+            print(f"  WARNING: error loading {psg.name}: {e}\n  Skipping this recording.")
+
+    if not X_list:
         print("No recordings were successfully loaded.")
-        return None, None, None
+        return None, None, None, None
+    return (np.concatenate(X_list), np.concatenate(y_list),
+            np.concatenate(subj_list), np.concatenate(night_list))
 
 
 if __name__ == "__main__":
-    # Run the batch loader for the first 5 recordings
-    X_all, y_all, subjects = batch_load_data(max_recordings=5)
-    
-    if X_all is not None:
-        print("\n--- Batch Loading Complete ---")
-        print(f"Combined X shape (Epochs, Channels, Time): {X_all.shape}")
-        print(f"Combined y shape (Labels): {y_all.shape}")
-        print(f"Total unique subjects successfully loaded: {len(np.unique(subjects))}")
-        print(f"Overall class distribution (bincount): {np.bincount(y_all)}")
-
-def split_by_subject(X, y, subjects, test_size=0.2, random_state=42):
-    """Split data by subject to prevent data leakage."""
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-    train_idx, test_idx = next(gss.split(X, y, groups=subjects))
-    
-    X_train, X_test = X[train_idx], X[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
-    train_subjects = np.unique(subjects[train_idx])
-    test_subjects = np.unique(subjects[test_idx])
-    
-    print(f"\nTraining subjects: {train_subjects} ({len(X_train)} epochs)")
-    print(f"Testing subjects:  {test_subjects} ({len(X_test)} epochs)")
-    
-    return X_train, y_train, X_test, y_test
+    X, y, subjects, nights = batch_load_raw(max_recordings=5)
+    if X is not None:
+        print("\n--- Raw batch loading complete ---")
+        print(f"X shape (epochs, channels, time): {X.shape}")
+        print(f"Unique subjects: {len(np.unique(subjects))}")
+        print(f"Class distribution (bincount): {np.bincount(y)}")
