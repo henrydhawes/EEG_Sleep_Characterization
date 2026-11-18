@@ -1,6 +1,26 @@
+# Data (local only; each teammate builds it with python src/features.py)
 data/
 *.edf
+*.zip
+
+# Large generated files, anywhere in the repo
 *.npz
+*.npy
+*.pkl
+*.parquet
+
+# Python
 __pycache__/
+*.pyc
 .ipynb_checkpoints/
+.pytest_cache/
+
+# Environments
 .venv/
+venv/
+
+# Editor and OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
