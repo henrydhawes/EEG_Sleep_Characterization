@@ -55,5 +55,6 @@ plt.xlabel("time (hours)")
 plt.ylabel("relative delta power")
 plt.title("Continuous Sleep Model")
 plt.legend()
+
+plt.savefig("sleep_depth_model.png", dpi=300, bbox_inches="tight")
 plt.show()
-  
